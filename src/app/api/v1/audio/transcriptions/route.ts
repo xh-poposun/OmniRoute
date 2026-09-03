@@ -27,6 +27,8 @@ import { generateRequestId } from "@/shared/utils/requestId";
 import { getComboByName, getCombos, getDatabaseSettings } from "@/lib/localDb";
 import { handleComboChat } from "@omniroute/open-sse/services/combo.ts";
 import { log } from "@omniroute/open-sse/utils/logger.ts";
+import { resolveProxyForConnection } from "@/lib/db/settings";
+import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
 
 /**
  * Copy a multipart body, swapping only the `model` field. Combo fan-out needs one
@@ -131,12 +133,27 @@ async function transcribeWithModel(
     }
   }
 
-  let response = await handleAudioTranscription({
-    formData,
-    credentials,
-    resolvedProvider: providerConfig,
-    resolvedModel,
-  });
+  let proxyInfo = null;
+
+  if (credentials?.connectionId) {
+    proxyInfo = await resolveProxyForConnection(
+      credentials.connectionId,
+      undefined,
+      provider
+    );
+  }
+
+  let response = await runWithProxyContext(
+    proxyInfo?.proxy ?? null,
+    () =>
+      handleAudioTranscription({
+        formData,
+        credentials,
+        resolvedProvider: providerConfig,
+        resolvedModel,
+      })
+  );
+
   if (response?.ok) {
     await clearRecoveredProviderState(credentials);
     // No text body / playback duration available from the multipart upload, so
