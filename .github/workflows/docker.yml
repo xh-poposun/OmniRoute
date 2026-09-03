@@ -58,6 +58,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          target: runner-base
           platforms: linux/amd64
           push: true
           pull: true
