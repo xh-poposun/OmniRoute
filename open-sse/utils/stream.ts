@@ -768,6 +768,45 @@ export function createSSEStream(options: StreamOptions = {}) {
   // empty (which happens when `store: false` — see backfillResponsesCompletedOutput).
   const passthroughResponsesOutputItems: unknown[] = [];
   const passthroughResponsesPendingFunctionCalls = new Map<string, JsonRecord>();
+
+  // Muse/OpenAI Responses compatibility:
+  // Some upstream Responses providers omit response.output_text.done and jump
+  // directly from response.output_text.delta to response.content_part.done.
+  // Strict Responses clients may reject that lifecycle.
+  //
+  // Track completed text parts and synthesize the missing output_text.done event.
+  const passthroughResponsesOutputTextDone = new Set<string>();
+
+  // Every synthesized event consumes one sequence_number. Keep all following
+  // downstream sequence numbers strictly monotonic without affecting upstream
+  // replay detection, which happens before this adjustment.
+  let passthroughResponsesSequenceOffset = 0;
+
+  const getResponsesTextPartKey = (
+    payload: JsonRecord
+  ): string | null => {
+    const itemId = stringifyIdValue(payload.item_id);
+
+    const outputIndex =
+      typeof payload.output_index === "number" &&
+      Number.isInteger(payload.output_index)
+        ? payload.output_index
+        : null;
+
+    const contentIndex =
+      typeof payload.content_index === "number" &&
+      Number.isInteger(payload.content_index)
+        ? payload.content_index
+        : null;
+
+    if (!itemId || outputIndex === null || contentIndex === null) {
+      return null;
+    }
+
+    return `${itemId}:${outputIndex}:${contentIndex}`;
+  };
+
+  
   let passthroughResponsesId: string | null = null;
   let passthroughResponsesCurrentFunctionCallKey: string | null = null;
   const passthroughResponsesReasoningSummarySeen = new Set<string>();
@@ -1398,6 +1437,87 @@ export function createSSEStream(options: StreamOptions = {}) {
                   }
 
                   const responsesIdsNormalized = normalizeResponsesSseIds(parsed as JsonRecord);
+                  // Preserve the provider's original sequence number. Replay detection has
+                  // already happened before this point, so downstream sequence rewriting is safe.
+                  const upstreamResponsesSequenceNumber =
+                    typeof parsed.sequence_number === "number" &&
+                    Number.isFinite(parsed.sequence_number)
+                      ? parsed.sequence_number
+                      : null;
+                  const responsesTextPartKey = getResponsesTextPartKey(
+                    parsed as JsonRecord
+                  );
+                  
+                  // Normal upstream event: remember that this text part was finalized.
+                  if (
+                    parsed.type === "response.output_text.done" &&
+                    responsesTextPartKey
+                  ) {
+                    passthroughResponsesOutputTextDone.add(responsesTextPartKey);
+                  }
+                  
+                  // Compatibility fix:
+                  // If content_part.done arrives without a preceding output_text.done,
+                  // synthesize the missing Responses lifecycle event.
+                  if (
+                    parsed.type === "response.content_part.done" &&
+                    responsesTextPartKey &&
+                    !passthroughResponsesOutputTextDone.has(responsesTextPartKey)
+                  ) {
+                    const part =
+                      parsed.part &&
+                      typeof parsed.part === "object" &&
+                      !Array.isArray(parsed.part)
+                      ? (parsed.part as JsonRecord)
+                      : null;
+                    
+                    if (part?.type === "output_text") {
+                      const syntheticDone: JsonRecord = {
+                        type: "response.output_text.done",
+                        item_id: parsed.item_id,
+                        output_index: parsed.output_index,
+                        content_index: parsed.content_index,
+                        text: typeof part.text === "string" ? part.text : "",
+                        logprobs: Array.isArray(part.logprobs) ? part.logprobs : [],
+                      };
+                      
+                      // Insert the synthetic event immediately before content_part.done.
+                      if (upstreamResponsesSequenceNumber !== null) {
+                        syntheticDone.sequence_number =
+                          upstreamResponsesSequenceNumber +
+                          passthroughResponsesSequenceOffset;
+                        
+                        passthroughResponsesSequenceOffset += 1;
+                      }
+
+                      passthroughResponsesOutputTextDone.add(
+                        responsesTextPartKey
+                      );
+                      
+                      const syntheticOutput =
+                        `event: response.output_text.done\n` +
+                        `data: ${JSON.stringify(syntheticDone)}\n\n`;
+                      
+                      clientPayloadCollector.push(syntheticDone);
+                      reqLogger?.appendConvertedChunk?.(syntheticOutput);
+                      forward(controller, encoder.encode(syntheticOutput));
+                    }
+                  }
+                  
+                  // Shift the current and all subsequent upstream sequence numbers by the
+                  // number of events synthesized so far.
+                  if (
+                    upstreamResponsesSequenceNumber !== null &&
+                    passthroughResponsesSequenceOffset > 0
+                  ) {
+                    parsed.sequence_number =
+                      upstreamResponsesSequenceNumber +
+                      passthroughResponsesSequenceOffset;
+                    
+                    output = `data: ${JSON.stringify(parsed)}\n\n`;
+                    injectedUsage = true;
+                  }
+
                   const parsedResponse =
                     parsed.response &&
                     typeof parsed.response === "object" &&
