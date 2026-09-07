@@ -777,18 +777,10 @@ export function createSSEStream(options: StreamOptions = {}) {
   // Track completed text parts and synthesize the missing output_text.done event.
   const passthroughResponsesOutputTextDone = new Set<string>();
 
-  // Sequence number exposed to Responses API clients.
-  //
-  // Upstream sequence_number is consumed by replay detection before the
-  // passthrough branch mutates the payload. From that point onward, assign a
-  // fresh contiguous sequence to every event sent to the downstream client,
-  // including OmniRoute-synthesized compatibility events.
-  let nextResponsesClientSequenceNumber = 0;
-
-  const assignResponsesClientSequence = (payload: JsonRecord): JsonRecord => {
-    payload.sequence_number = nextResponsesClientSequenceNumber++;
-    return payload;
-  };
+  // Every synthesized event consumes one sequence_number. Keep all following
+  // downstream sequence numbers strictly monotonic without affecting upstream
+  // replay detection, which happens before this adjustment.
+  let passthroughResponsesSequenceOffset = 0;
 
   const getResponsesTextPartKey = (
     payload: JsonRecord
@@ -1216,7 +1208,6 @@ export function createSSEStream(options: StreamOptions = {}) {
     ];
 
     for (const syntheticEvent of syntheticEvents) {
-      assignResponsesClientSequence(syntheticEvent.body as JsonRecord);
       clientPayloadCollector.push(syntheticEvent.body);
       const output = `event: ${syntheticEvent.event}\ndata: ${JSON.stringify(syntheticEvent.body)}\n\n`;
       reqLogger?.appendConvertedChunk?.(output);
@@ -1445,11 +1436,18 @@ export function createSSEStream(options: StreamOptions = {}) {
                     continue;
                   }
 
-                  normalizeResponsesSseIds(parsed as JsonRecord);
+                  const responsesIdsNormalized = normalizeResponsesSseIds(parsed as JsonRecord);
+                  // Preserve the provider's original sequence number. Replay detection has
+                  // already happened before this point, so downstream sequence rewriting is safe.
+                  const upstreamResponsesSequenceNumber =
+                    typeof parsed.sequence_number === "number" &&
+                    Number.isFinite(parsed.sequence_number)
+                      ? parsed.sequence_number
+                      : null;
                   const responsesTextPartKey = getResponsesTextPartKey(
                     parsed as JsonRecord
                   );
-
+                  
                   // Normal upstream event: remember that this text part was finalized.
                   if (
                     parsed.type === "response.output_text.done" &&
@@ -1457,10 +1455,10 @@ export function createSSEStream(options: StreamOptions = {}) {
                   ) {
                     passthroughResponsesOutputTextDone.add(responsesTextPartKey);
                   }
-
-                  // Muse/OpenAI Responses compatibility:
-                  // If content_part.done arrives without a preceding
-                  // response.output_text.done, synthesize the missing lifecycle event.
+                  
+                  // Compatibility fix:
+                  // If content_part.done arrives without a preceding output_text.done,
+                  // synthesize the missing Responses lifecycle event.
                   if (
                     parsed.type === "response.content_part.done" &&
                     responsesTextPartKey &&
@@ -1470,9 +1468,9 @@ export function createSSEStream(options: StreamOptions = {}) {
                       parsed.part &&
                       typeof parsed.part === "object" &&
                       !Array.isArray(parsed.part)
-                        ? (parsed.part as JsonRecord)
-                        : null;
-
+                      ? (parsed.part as JsonRecord)
+                      : null;
+                    
                     if (part?.type === "output_text") {
                       const syntheticDone: JsonRecord = {
                         type: "response.output_text.done",
@@ -1482,18 +1480,42 @@ export function createSSEStream(options: StreamOptions = {}) {
                         text: typeof part.text === "string" ? part.text : "",
                         logprobs: Array.isArray(part.logprobs) ? part.logprobs : [],
                       };
+                      
+                      // Insert the synthetic event immediately before content_part.done.
+                      if (upstreamResponsesSequenceNumber !== null) {
+                        syntheticDone.sequence_number =
+                          upstreamResponsesSequenceNumber +
+                          passthroughResponsesSequenceOffset;
+                        
+                        passthroughResponsesSequenceOffset += 1;
+                      }
 
-                      assignResponsesClientSequence(syntheticDone);
-                      passthroughResponsesOutputTextDone.add(responsesTextPartKey);
-
+                      passthroughResponsesOutputTextDone.add(
+                        responsesTextPartKey
+                      );
+                      
                       const syntheticOutput =
                         `event: response.output_text.done\n` +
                         `data: ${JSON.stringify(syntheticDone)}\n\n`;
-
+                      
                       clientPayloadCollector.push(syntheticDone);
                       reqLogger?.appendConvertedChunk?.(syntheticOutput);
                       forward(controller, encoder.encode(syntheticOutput));
                     }
+                  }
+                  
+                  // Shift the current and all subsequent upstream sequence numbers by the
+                  // number of events synthesized so far.
+                  if (
+                    upstreamResponsesSequenceNumber !== null &&
+                    passthroughResponsesSequenceOffset > 0
+                  ) {
+                    parsed.sequence_number =
+                      upstreamResponsesSequenceNumber +
+                      passthroughResponsesSequenceOffset;
+                    
+                    output = `data: ${JSON.stringify(parsed)}\n\n`;
+                    injectedUsage = true;
                   }
 
                   const parsedResponse =
@@ -1666,6 +1688,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                       }
                     }
                   }
+                  let responsesCommentaryStrippedFromCompleted = false;
                   if (
                     parsed.type === "response.completed" &&
                     Array.isArray(parsed.response?.output) &&
@@ -1682,6 +1705,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                       );
                       if (changed) {
                         parsed.response.output = items;
+                        responsesCommentaryStrippedFromCompleted = true;
                       }
                     }
                     pushUniqueResponsesOutputItems(
@@ -1726,7 +1750,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                       ...passthroughToolCalls.values(),
                     ]) as typeof parsed;
                   }
-                  stripResponsesLifecycleEcho(parsed);
+                  const stripped = stripResponsesLifecycleEcho(parsed);
                   // Belt-and-suspenders for #10156: filter the backfill buffer itself
                   // before it can seed an empty `response.completed.response.output`,
                   // in case a future code path pushes a commentary item into it
@@ -1737,18 +1761,22 @@ export function createSSEStream(options: StreamOptions = {}) {
                         isResponsesCommentaryMessageItem
                       ).items
                     : passthroughResponsesOutputItems;
-                  backfillResponsesCompletedOutput(
+                  const backfilled = backfillResponsesCompletedOutput(
                     parsed,
                     backfillCandidates
                   );
-                  normalizeUsage(parsed);
-
-                  // Always re-number and re-serialize Responses events exposed to the
-                  // downstream client. Replay detection already consumed the original
-                  // upstream sequence_number before entering this branch.
-                  assignResponsesClientSequence(parsed as JsonRecord);
-                  output = `data: ${JSON.stringify(parsed)}\n\n`;
-                  injectedUsage = true;
+                  const usageNormalized = normalizeUsage(parsed);
+                  if (
+                    stripped ||
+                    backfilled ||
+                    textualToolCallBackfilled ||
+                    responsesIdsNormalized ||
+                    usageNormalized ||
+                    responsesCommentaryStrippedFromCompleted
+                  ) {
+                    output = `data: ${JSON.stringify(parsed)}\n\n`;
+                    injectedUsage = true;
+                  }
                 } else if (isClaudeSSE) {
                   // Claude SSE: extract usage, track content, forward as-is
                   const thinkingSignatureInjected = injectThinkingSignature(parsed, provider);
@@ -2458,10 +2486,32 @@ export function createSSEStream(options: StreamOptions = {}) {
                   const isResponses = flushedType.startsWith("response.");
                   const isClaude = isClaudeEventPayload(flushedParsed);
                   if (isResponses) {
-                    normalizeResponsesSseIds(flushedParsed);
-                    normalizeUsage(flushedParsed);
-                    assignResponsesClientSequence(flushedParsed);
-                    output = `data: ${JSON.stringify(flushedParsed)}\n\n`;
+                    // The final Responses event can land in flush() when the upstream
+                    // closes without a trailing newline. Keep its downstream
+                    // sequence_number consistent with events already shifted in
+                    // transform() after synthesizing response.output_text.done.
+                    const upstreamResponsesSequenceNumber =
+                      typeof flushedParsed.sequence_number === "number" &&
+                      Number.isFinite(flushedParsed.sequence_number)
+                        ? flushedParsed.sequence_number
+                        : null;
+
+                    let responsesSequenceAdjusted = false;
+                    if (
+                      upstreamResponsesSequenceNumber !== null &&
+                      passthroughResponsesSequenceOffset > 0
+                    ) {
+                      flushedParsed.sequence_number =
+                        upstreamResponsesSequenceNumber +
+                        passthroughResponsesSequenceOffset;
+                      responsesSequenceAdjusted = true;
+                    }
+
+                    const idsNormalized = normalizeResponsesSseIds(flushedParsed);
+                    const usageNormalized = normalizeUsage(flushedParsed);
+                    if (idsNormalized || usageNormalized || responsesSequenceAdjusted) {
+                      output = `data: ${JSON.stringify(flushedParsed)}\n\n`;
+                    }
                   } else if (!isClaude) {
                     const { changed: flushChanged, hasFinishReason } =
                       normalizeFinalOpenAIStreamChunk(flushedParsed, toolNameMap);
