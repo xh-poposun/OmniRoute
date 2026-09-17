@@ -49,7 +49,6 @@ jobs:
         with:
           images: ${{ steps.image.outputs.name }}
           tags: |
-            type=raw,value=latest
             type=raw,value=3.8.50-custom
             type=sha,prefix=sha-
 
